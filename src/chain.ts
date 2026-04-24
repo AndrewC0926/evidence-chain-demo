@@ -6,7 +6,7 @@ export type VerifyResult =
   | { valid: true; count: number }
   | { valid: false; brokenAtId: string; expected: string; actual: string };
 
-function canonicalJson(value: unknown): string {
+export function canonicalJson(value: unknown): string {
   if (value === null || typeof value !== 'object') {
     return JSON.stringify(value);
   }
@@ -19,7 +19,7 @@ function canonicalJson(value: unknown): string {
   return '{' + entries.join(',') + '}';
 }
 
-async function sha256Hex(input: string): Promise<string> {
+export async function sha256Hex(input: string): Promise<string> {
   const bytes = new TextEncoder().encode(input);
   const digest = await crypto.subtle.digest('SHA-256', bytes);
   return Array.from(new Uint8Array(digest))

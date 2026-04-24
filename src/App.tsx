@@ -5,12 +5,19 @@ import {
   writeRecord,
   verifyChain,
   tamperWithRecord,
+  computeRecordHash,
   GENESIS_PREV_HASH,
 } from './chain';
 import type { VerifyResult } from './chain';
 import { FIXTURES } from './fixtures';
+import { FrameworkCoverage } from './FrameworkCoverage';
+import { AiPolicyDecisions } from './AiPolicyDecisions';
 
 const SYSTEMS = ['okta', 'github', 'aws', 'snowflake', 'salesforce'] as const;
+
+type TipVerifyResult =
+  | { valid: true; recordsSince: number }
+  | { valid: false; brokenAtId: string };
 
 function shortHash(hash: string): string {
   if (hash === GENESIS_PREV_HASH) return 'genesis';
@@ -30,10 +37,43 @@ async function buildFixtureChain(): Promise<EvidenceRecord[]> {
   return chain;
 }
 
+async function verifyChainFromTip(
+  chain: EvidenceRecord[],
+  tip: PublishedTip,
+): Promise<TipVerifyResult> {
+  if (chain.length <= tip.recordIndex) {
+    return { valid: false, brokenAtId: `rec-${tip.recordIndex + 1}` };
+  }
+  let prev = GENESIS_PREV_HASH;
+  for (let i = 0; i < chain.length; i += 1) {
+    const r = chain[i];
+    if (!r) continue;
+    if (r.prevHash !== prev) {
+      return { valid: false, brokenAtId: r.id };
+    }
+    const { recordHash: stored, ...rest } = r;
+    const expected = await computeRecordHash(rest);
+    if (stored !== expected) {
+      return { valid: false, brokenAtId: r.id };
+    }
+    if (i === tip.recordIndex && stored !== tip.tipHash) {
+      return { valid: false, brokenAtId: r.id };
+    }
+    prev = stored;
+  }
+  return {
+    valid: true,
+    recordsSince: chain.length - tip.recordIndex - 1,
+  };
+}
+
 export function App() {
   const [chain, setChain] = useState<EvidenceRecord[]>([]);
   const [publishedTips, setPublishedTips] = useState<PublishedTip[]>([]);
   const [verifyResult, setVerifyResult] = useState<VerifyResult | null>(null);
+  const [tipVerifyResults, setTipVerifyResults] = useState<
+    Record<number, TipVerifyResult>
+  >({});
   const [ready, setReady] = useState(false);
 
   useEffect(() => {
@@ -42,6 +82,11 @@ export function App() {
       setChain(initial);
       setReady(true);
     })();
+  }, []);
+
+  const clearTransientResults = useCallback(() => {
+    setVerifyResult(null);
+    setTipVerifyResults({});
   }, []);
 
   const runControl = useCallback(async () => {
@@ -68,8 +113,8 @@ export function App() {
     };
     const newRecord = await writeRecord(chain, seed);
     setChain([...chain, newRecord]);
-    setVerifyResult(null);
-  }, [chain]);
+    clearTransientResults();
+  }, [chain, clearTransientResults]);
 
   const verify = useCallback(async () => {
     const result = await verifyChain(chain);
@@ -79,13 +124,16 @@ export function App() {
   const reset = useCallback(async () => {
     const initial = await buildFixtureChain();
     setChain(initial);
-    setVerifyResult(null);
-  }, []);
+    clearTransientResults();
+  }, [clearTransientResults]);
 
-  const tamper = useCallback((id: string) => {
-    setChain((prev) => tamperWithRecord(prev, id));
-    setVerifyResult(null);
-  }, []);
+  const tamper = useCallback(
+    (id: string) => {
+      setChain((prev) => tamperWithRecord(prev, id));
+      clearTransientResults();
+    },
+    [clearTransientResults],
+  );
 
   const currentTip = useMemo(() => {
     const last = chain[chain.length - 1];
@@ -96,9 +144,23 @@ export function App() {
     if (chain.length === 0) return;
     setPublishedTips((prev) => [
       ...prev,
-      { tipHash: currentTip, publishedAt: new Date().toISOString() },
+      {
+        tipHash: currentTip,
+        publishedAt: new Date().toISOString(),
+        recordIndex: chain.length - 1,
+      },
     ]);
   }, [chain, currentTip]);
+
+  const verifyFromTip = useCallback(
+    async (tipIndex: number) => {
+      const tip = publishedTips[tipIndex];
+      if (!tip) return;
+      const result = await verifyChainFromTip(chain, tip);
+      setTipVerifyResults((prev) => ({ ...prev, [tipIndex]: result }));
+    },
+    [chain, publishedTips],
+  );
 
   if (!ready) {
     return <div className="min-h-screen bg-neutral-950" />;
@@ -119,8 +181,9 @@ export function App() {
         <section className="rounded-lg border border-amber-500/20 bg-amber-500/5 p-4">
           <p className="text-sm text-amber-100/80 leading-relaxed">
             This demonstrates hash-chained audit evidence. The chain detects
-            tampering within itself. It does not protect against a database admin
-            rewriting every record, which is why the External Anchor exists.
+            tampering within itself. It does not protect against a database
+            admin rewriting every record, which is why the External Anchor
+            exists.
           </p>
         </section>
 
@@ -162,6 +225,10 @@ export function App() {
 
         {verifyResult ? <VerifyPanel result={verifyResult} /> : null}
 
+        <FrameworkCoverage />
+
+        <AiPolicyDecisions />
+
         <section className="space-y-3 border-t border-neutral-800 pt-8">
           <div className="flex items-baseline justify-between">
             <h2 className="text-xs uppercase tracking-wider text-neutral-500">
@@ -180,23 +247,49 @@ export function App() {
             {publishedTips.length === 0 ? (
               <li className="text-xs text-neutral-600">No tips published yet.</li>
             ) : null}
-            {publishedTips.map((tip, i) => (
-              <li
-                key={i}
-                className="flex items-center justify-between rounded-md border border-neutral-800 bg-neutral-900/50 px-3 py-2 text-xs font-mono gap-3"
-              >
-                <span className="text-neutral-500">
-                  {formatTimestamp(tip.publishedAt)}
-                </span>
-                <span className="text-emerald-400">
-                  {shortHash(tip.tipHash)}
-                </span>
-              </li>
-            ))}
+            {publishedTips.map((tip, i) => {
+              const result = tipVerifyResults[i];
+              return (
+                <li
+                  key={i}
+                  className="rounded-md border border-neutral-800 bg-neutral-900/50 p-3 space-y-2"
+                >
+                  <div className="flex items-center justify-between gap-3 text-xs font-mono">
+                    <span className="text-neutral-500">
+                      {formatTimestamp(tip.publishedAt)}
+                    </span>
+                    <span className="text-emerald-400">
+                      {shortHash(tip.tipHash)}
+                    </span>
+                  </div>
+                  <div className="flex items-center justify-between gap-3 flex-wrap">
+                    <span className="text-xs text-neutral-500">
+                      covers records 1-{tip.recordIndex + 1}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        void verifyFromTip(i);
+                      }}
+                      className="text-xs text-neutral-400 hover:text-neutral-100 border border-neutral-800 hover:border-neutral-600 rounded px-2 py-1 transition-colors"
+                    >
+                      Verify from this tip
+                    </button>
+                  </div>
+                  {result ? (
+                    <TipResultInline
+                      result={result}
+                      publishedAt={tip.publishedAt}
+                    />
+                  ) : null}
+                </li>
+              );
+            })}
           </ul>
           <p className="text-xs text-neutral-500 leading-relaxed">
-            In production this is S3 Object Lock. Published tips persist across
-            resets.
+            In production, tips are written to S3 Object Lock in Compliance
+            mode. An auditor can verify any historical point by walking forward
+            from the published tip, independent of the database state.
           </p>
         </section>
 
@@ -246,7 +339,9 @@ function RecordCard({ record, index, onTamper, broken }: RecordCardProps) {
     ? 'border-red-500/50 bg-red-500/5'
     : 'border-neutral-800 bg-neutral-900/40';
   return (
-    <div className={`rounded-lg border ${border} p-4 space-y-3 transition-colors`}>
+    <div
+      className={`rounded-lg border ${border} p-4 space-y-3 transition-colors`}
+    >
       <div className="flex items-start justify-between gap-3">
         <div className="space-y-1 min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
@@ -259,7 +354,7 @@ function RecordCard({ record, index, onTamper, broken }: RecordCardProps) {
           </div>
           <div className="text-xs text-neutral-500">
             <span className="text-neutral-400">{system}</span>
-            {' · '}
+            <span> · </span>
             {formatTimestamp(record.runAt)}
           </div>
         </div>
@@ -276,10 +371,14 @@ function RecordCard({ record, index, onTamper, broken }: RecordCardProps) {
       </div>
       <div className="flex flex-col sm:flex-row sm:gap-6 gap-1 text-xs font-mono">
         <span className="text-neutral-600">
-          prev: <span className="text-neutral-500">{shortHash(record.prevHash)}</span>
+          prev:{' '}
+          <span className="text-neutral-500">{shortHash(record.prevHash)}</span>
         </span>
         <span className="text-neutral-600">
-          hash: <span className="text-neutral-300">{shortHash(record.recordHash)}</span>
+          hash:{' '}
+          <span className="text-neutral-300">
+            {shortHash(record.recordHash)}
+          </span>
         </span>
       </div>
     </div>
@@ -333,6 +432,31 @@ function VerifyPanel({ result }: { result: VerifyResult }) {
           <span className="text-red-300">{result.actual}</span>
         </div>
       </div>
+    </div>
+  );
+}
+
+type TipResultInlineProps = {
+  result: TipVerifyResult;
+  publishedAt: string;
+};
+
+function TipResultInline({ result, publishedAt }: TipResultInlineProps) {
+  if (result.valid) {
+    return (
+      <div className="rounded border border-emerald-500/30 bg-emerald-500/5 px-3 py-2">
+        <p className="text-xs text-emerald-200">
+          Chain intact from tip published at {formatTimestamp(publishedAt)},{' '}
+          {result.recordsSince} records since.
+        </p>
+      </div>
+    );
+  }
+  return (
+    <div className="rounded border border-red-500/40 bg-red-500/5 px-3 py-2">
+      <p className="text-xs text-red-200">
+        Chain diverges from tip at record {result.brokenAtId}.
+      </p>
     </div>
   );
 }

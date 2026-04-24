@@ -22,4 +22,5 @@ export type EvidenceRecord = {
 export type PublishedTip = {
   tipHash: string;
   publishedAt: string;
+  recordIndex: number;
 };
